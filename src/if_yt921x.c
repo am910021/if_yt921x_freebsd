@@ -10,13 +10,19 @@
 #include <sys/lock.h>
 #include <sys/module.h>
 #include <sys/mutex.h>
+#include <sys/socket.h>
 #include <sys/systm.h>
 
+#include <net/if.h>
+#include <net/if_media.h>
+
+#include <dev/etherswitch/etherswitch.h>
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
 #include <dev/ofw/openfirm.h>
 
 #include "mdio_if.h"
+#include "etherswitch_if.h"
 
 #define YT921X_MDIO_ADDR	0x1d
 #define YT921X_SWITCH_ID_MAX	3
@@ -39,6 +45,7 @@
 #define YT921X_SERDES9		0x80090
 #define YT921X_INT_MBUS_OP	0xf0000
 #define YT921X_INT_MBUS_CTRL	0xf0004
+#define YT921X_INT_MBUS_DOUT	0xf0008
 #define YT921X_INT_MBUS_DIN	0xf000c
 
 #define YT921X_SERDES_CTRL_PORT9	(1U << 1)
@@ -61,6 +68,7 @@
 #define YT921X_MBUS_REG_MASK	(0x1fU << 16)
 #define YT921X_MBUS_REG(reg)	((uint32_t)(reg) << 16)
 #define YT921X_MBUS_OP_MASK	(3U << 2)
+#define YT921X_MBUS_WRITE	(1U << 2)
 #define YT921X_MBUS_READ	(2U << 2)
 
 struct yt921x_softc {
@@ -68,6 +76,7 @@ struct yt921x_softc {
 	struct mtx	mtx;
 	int		addr;
 	int		switch_id;
+	etherswitch_info_t info;
 };
 
 static phandle_t
@@ -294,6 +303,32 @@ yt921x_phy_read(struct yt921x_softc *sc, int port, int reg, uint16_t *value)
 	return (error);
 }
 
+static int
+yt921x_phy_write(struct yt921x_softc *sc, int port, int reg, uint16_t value)
+{
+	uint32_t ctrl, mask;
+	int error;
+
+	mask = YT921X_MBUS_PORT_MASK | YT921X_MBUS_REG_MASK |
+	    YT921X_MBUS_OP_MASK;
+	ctrl = YT921X_MBUS_PORT(port) | YT921X_MBUS_REG(reg) |
+	    YT921X_MBUS_WRITE;
+	mtx_lock(&sc->mtx);
+	error = yt921x_mbus_wait_locked(sc);
+	if (error == 0)
+		error = yt921x_update_locked(sc, YT921X_INT_MBUS_CTRL,
+		    mask, ctrl);
+	if (error == 0)
+		error = yt921x_write_locked(sc, YT921X_INT_MBUS_DOUT, value);
+	if (error == 0)
+		error = yt921x_write_locked(sc, YT921X_INT_MBUS_OP,
+		    YT921X_MBUS_START);
+	if (error == 0)
+		error = yt921x_mbus_wait_locked(sc);
+	mtx_unlock(&sc->mtx);
+	return (error);
+}
+
 static void
 yt921x_log_phys(struct yt921x_softc *sc)
 {
@@ -311,6 +346,146 @@ yt921x_log_phys(struct yt921x_softc *sc)
 			device_printf(sc->dev, "cannot read port %u PHY: %d\n",
 			    port, error);
 	}
+}
+
+static etherswitch_info_t *
+yt921x_getinfo(device_t dev)
+{
+	struct yt921x_softc *sc;
+
+	sc = device_get_softc(dev);
+	return (&sc->info);
+}
+
+static void
+yt921x_lock(device_t dev)
+{
+	struct yt921x_softc *sc;
+
+	sc = device_get_softc(dev);
+	mtx_lock(&sc->mtx);
+}
+
+static void
+yt921x_unlock(device_t dev)
+{
+	struct yt921x_softc *sc;
+
+	sc = device_get_softc(dev);
+	mtx_unlock(&sc->mtx);
+}
+
+static int
+yt921x_readreg(device_t dev, int reg)
+{
+	struct yt921x_softc *sc;
+	uint32_t value;
+
+	sc = device_get_softc(dev);
+	if (yt921x_read_locked(sc, reg, &value) != 0)
+		return (0);
+	return (value);
+}
+
+static int
+yt921x_writereg(device_t dev, int reg, int value)
+{
+	struct yt921x_softc *sc;
+
+	sc = device_get_softc(dev);
+	return (yt921x_write_locked(sc, reg, value));
+}
+
+static int
+yt921x_readphyreg(device_t dev, int phy, int reg)
+{
+	struct yt921x_softc *sc;
+	uint16_t value;
+	int error;
+
+	if (phy < 1 || phy > 4 || reg < 0 || reg > 31)
+		return (EINVAL);
+	sc = device_get_softc(dev);
+	error = yt921x_phy_read(sc, phy, reg, &value);
+	return (error == 0 ? value : error);
+}
+
+static int
+yt921x_writephyreg(device_t dev, int phy, int reg, int value)
+{
+	struct yt921x_softc *sc;
+
+	if (phy < 1 || phy > 4 || reg < 0 || reg > 31)
+		return (EINVAL);
+	sc = device_get_softc(dev);
+	return (yt921x_phy_write(sc, phy, reg, value));
+}
+
+static int
+yt921x_getport(device_t dev, etherswitch_port_t *port)
+{
+	struct yt921x_softc *sc;
+	struct ifmediareq *ifmr;
+	uint32_t status;
+	int hwport, subtype;
+
+	if (port->es_port < 0 || port->es_port >= 5)
+		return (EINVAL);
+	sc = device_get_softc(dev);
+	hwport = port->es_port == 4 ? 9 : port->es_port + 1;
+	if (yt921x_read(sc, 0x80200 + 4 * hwport, &status) != 0)
+		return (EIO);
+
+	port->es_pvid = 0;
+	port->es_flags = hwport == 9 ? ETHERSWITCH_PORT_CPU : 0;
+	ifmr = &port->es_ifmr;
+	ifmr->ifm_count = 0;
+	ifmr->ifm_mask = 0;
+	ifmr->ifm_current = IFM_ETHER |
+	    (hwport == 9 ? IFM_1000_T : IFM_AUTO);
+	switch (status & 0x7) {
+	case 0:
+		subtype = IFM_10_T;
+		break;
+	case 1:
+		subtype = IFM_100_TX;
+		break;
+	default:
+		subtype = IFM_1000_T;
+		break;
+	}
+	ifmr->ifm_active = IFM_ETHER | subtype;
+	if (status & (1U << 7))
+		ifmr->ifm_active |= IFM_FDX;
+	if (status & (1U << 6))
+		ifmr->ifm_active |= IFM_ETH_RXPAUSE;
+	if (status & (1U << 5))
+		ifmr->ifm_active |= IFM_ETH_TXPAUSE;
+	ifmr->ifm_status = IFM_AVALID;
+	if (hwport == 9 || (status & (1U << 9)) != 0)
+		ifmr->ifm_status |= IFM_ACTIVE;
+	return (0);
+}
+
+static int
+yt921x_setport(device_t dev, etherswitch_port_t *port)
+{
+
+	return (EOPNOTSUPP);
+}
+
+static int
+yt921x_getvgroup(device_t dev, etherswitch_vlangroup_t *group)
+{
+
+	return (EOPNOTSUPP);
+}
+
+static int
+yt921x_setvgroup(device_t dev, etherswitch_vlangroup_t *group)
+{
+
+	return (EOPNOTSUPP);
 }
 
 static void
@@ -345,6 +520,10 @@ yt921x_attach(device_t dev)
 	sc->dev = dev;
 	sc->addr = YT921X_MDIO_ADDR;
 	sc->switch_id = 0;
+	sc->info.es_nports = 5;
+	sc->info.es_nvlangroups = 0;
+	strlcpy(sc->info.es_name, "Motorcomm YT9215S",
+	    sizeof(sc->info.es_name));
 	node = yt921x_find_node(dev);
 	if (OF_getencprop(node, "reg", &value, sizeof(value)) > 0)
 		sc->addr = value;
@@ -388,7 +567,8 @@ yt921x_attach(device_t dev)
 	yt921x_log_port9(sc);
 	yt921x_log_user_ports(sc);
 	yt921x_log_phys(sc);
-	return (0);
+	bus_generic_probe(dev);
+	return (bus_generic_attach(dev));
 }
 
 static int
@@ -397,6 +577,7 @@ yt921x_detach(device_t dev)
 	struct yt921x_softc *sc;
 
 	sc = device_get_softc(dev);
+	bus_generic_detach(dev);
 	mtx_destroy(&sc->mtx);
 	return (0);
 }
@@ -406,11 +587,25 @@ static device_method_t yt921x_methods[] = {
 	DEVMETHOD(device_probe,		yt921x_probe),
 	DEVMETHOD(device_attach,	yt921x_attach),
 	DEVMETHOD(device_detach,	yt921x_detach),
+	DEVMETHOD(bus_add_child,	device_add_child_ordered),
+	DEVMETHOD(etherswitch_getinfo,	yt921x_getinfo),
+	DEVMETHOD(etherswitch_lock,	yt921x_lock),
+	DEVMETHOD(etherswitch_unlock,	yt921x_unlock),
+	DEVMETHOD(etherswitch_readreg,	yt921x_readreg),
+	DEVMETHOD(etherswitch_writereg,	yt921x_writereg),
+	DEVMETHOD(etherswitch_readphyreg,	yt921x_readphyreg),
+	DEVMETHOD(etherswitch_writephyreg,	yt921x_writephyreg),
+	DEVMETHOD(etherswitch_getport,	yt921x_getport),
+	DEVMETHOD(etherswitch_setport,	yt921x_setport),
+	DEVMETHOD(etherswitch_getvgroup,	yt921x_getvgroup),
+	DEVMETHOD(etherswitch_setvgroup,	yt921x_setvgroup),
 	DEVMETHOD_END
 };
 
 DEFINE_CLASS_0(yt921x, yt921x_driver, yt921x_methods,
     sizeof(struct yt921x_softc));
 DRIVER_MODULE(yt921x, mdio, yt921x_driver, 0, 0);
+DRIVER_MODULE(etherswitch, yt921x, etherswitch_driver, 0, 0);
 MODULE_DEPEND(yt921x, mdio, 1, 1, 1);
+MODULE_DEPEND(yt921x, etherswitch, 1, 1, 1);
 MODULE_VERSION(yt921x, 1);
