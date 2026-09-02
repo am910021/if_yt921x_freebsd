@@ -17,6 +17,7 @@
 #include <net/if_media.h>
 
 #include <dev/etherswitch/etherswitch.h>
+#include <dev/mii/mii.h>
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
 #include <dev/ofw/openfirm.h>
@@ -478,8 +479,8 @@ yt921x_log_user_ports(struct yt921x_softc *sc)
 	for (u_int port = 1; port <= 4; port++) {
 		error = yt921x_read(sc, 0x80200 + 4 * port, &status);
 		if (error == 0)
-			device_printf(sc->dev, "port %u status=%#x%s\n", port,
-			    status, (status & (1U << 9)) != 0 ? " link" : "");
+			device_printf(sc->dev, "port %u status=%#x\n", port,
+			    status);
 	}
 }
 
@@ -650,6 +651,7 @@ yt921x_getport(device_t dev, etherswitch_port_t *port)
 	struct yt921x_softc *sc;
 	struct ifmediareq *ifmr;
 	uint32_t filter, status, vlan, vlan1;
+	uint16_t bmsr = 0;
 	int error;
 	int hwport, subtype;
 
@@ -668,6 +670,11 @@ yt921x_getport(device_t dev, etherswitch_port_t *port)
 	if (error == 0)
 		error = yt921x_read_locked(sc, YT921X_VLAN_IGR_FILTER, &filter);
 	mtx_unlock(&sc->mtx);
+	if (error == 0 && hwport != YT921X_HW_CPU_PORT) {
+		error = yt921x_phy_read(sc, hwport, MII_BMSR, &bmsr);
+		if (error == 0)
+			error = yt921x_phy_read(sc, hwport, MII_BMSR, &bmsr);
+	}
 	if (error != 0)
 		return (error);
 
@@ -704,7 +711,7 @@ yt921x_getport(device_t dev, etherswitch_port_t *port)
 	if (status & (1U << 5))
 		ifmr->ifm_active |= IFM_ETH_TXPAUSE;
 	ifmr->ifm_status = IFM_AVALID;
-	if (hwport == 9 || (status & (1U << 9)) != 0)
+	if (hwport == YT921X_HW_CPU_PORT || (bmsr & BMSR_LINK) != 0)
 		ifmr->ifm_status |= IFM_ACTIVE;
 	return (0);
 }
