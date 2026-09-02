@@ -32,6 +32,7 @@
 #define YT921X_SMI_DATA_WRITE(id)	(((id) << 2) | 0x2)
 
 #define YT921X_CHIP_ID		0x80008
+#define YT921X_EXT_CPU_PORT	0x8000c
 #define YT921X_CHIP_MODE	0x80388
 #define YT9215_CHIP_MAJOR	0x9002
 #define YT9215S_CHIP_MODE	2
@@ -47,6 +48,9 @@
 #define YT921X_INT_MBUS_CTRL	0xf0004
 #define YT921X_INT_MBUS_DOUT	0xf0008
 #define YT921X_INT_MBUS_DIN	0xf000c
+#define YT921X_FILTER_UNK_UCAST	0x180508
+#define YT921X_FILTER_UNK_MCAST	0x18050c
+#define YT921X_CPU_COPY		0x180690
 
 #define YT921X_SERDES_CTRL_PORT9	(1U << 1)
 #define YT921X_XMII_CTRL_PORT9	(1U << 0)
@@ -61,6 +65,9 @@
 #define YT921X_PORT9_LINK_1G	0x000000fa
 #define YT921X_SERDES9_LINK_1G	0x0000007a
 #define YT921X_POLLING9_LINK_1G	0x0000001a
+#define YT921X_EXT_CPU_PORT9	0x00004009
+#define YT921X_CPU_COPY_TO_EXT	0x00000001
+#define YT921X_FILTER_ALL_PORTS	0x000007ff
 
 #define YT921X_MBUS_START	(1U << 0)
 #define YT921X_MBUS_PORT_MASK	(0x1fU << 21)
@@ -194,6 +201,21 @@ yt921x_configure_port9(struct yt921x_softc *sc)
 	uint32_t mask, value;
 	int error;
 
+	error = yt921x_write(sc, YT921X_EXT_CPU_PORT,
+	    YT921X_EXT_CPU_PORT9);
+	if (error != 0)
+		return (error);
+	error = yt921x_write(sc, YT921X_CPU_COPY, YT921X_CPU_COPY_TO_EXT);
+	if (error != 0)
+		return (error);
+	error = yt921x_write(sc, YT921X_FILTER_UNK_UCAST,
+	    YT921X_FILTER_ALL_PORTS);
+	if (error != 0)
+		return (error);
+	error = yt921x_write(sc, YT921X_FILTER_UNK_MCAST,
+	    YT921X_FILTER_ALL_PORTS);
+	if (error != 0)
+		return (error);
 	error = yt921x_update(sc, YT921X_SERDES_CTRL,
 	    YT921X_SERDES_CTRL_PORT9, 0);
 	if (error != 0)
