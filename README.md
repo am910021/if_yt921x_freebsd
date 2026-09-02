@@ -8,8 +8,23 @@ fixed 1 Gbps RGMII-TXID CPU link.  It deliberately does not reset the whole
 switch or enable DSA tagging.
 
 Each chip is also exposed through FreeBSD's native `etherswitch(4)` interface
-as four user ports plus one fixed CPU port.  Media changes and VLAN programming
-are not implemented yet; the hardware power-on configuration remains active.
+as four user ports plus one fixed CPU port.  The driver reports real PVID and
+ingress-filter state and supports 128 software VLAN groups mapped to hardware
+VIDs 1 through 4094.  VLAN membership, tagged/untagged membership, PVID, and
+tagged/untagged ingress rules are programmable; media changes are not.
+
+The CPU port is logical port 4.  It is automatically retained as a tagged
+member whenever a VLAN has members, so normal FreeBSD `vlan(4)` traffic can
+reach the switch without the proprietary YT921x DSA tag:
+
+```sh
+etherswitchcfg -f /dev/etherswitch0 vlangroup1 vlan 100 members 0,4t
+etherswitchcfg -f /dev/etherswitch0 port0 pvid 100 ingress
+```
+
+The driver does not reset the switch or replace its power-on forwarding setup.
+Only VLAN groups configured during the current module lifetime are listed;
+remove a group with `vlan 0` before unloading the module.
 
 The MDIO indirect-register protocol and register values were independently
 implemented from the behavior documented by the Linux `yt921x` driver by David
