@@ -2,9 +2,10 @@
 
 Out-of-tree FreeBSD kernel module for Motorcomm YT921x Ethernet switches.
 
-The current validation stage only discovers `motorcomm,yt9215` children on an
-MDIO bus and verifies the chip major and mode.  It deliberately does not reset
-or configure the switch yet.
+The current validation stage discovers `motorcomm,yt9215` children on an MDIO
+bus, verifies the chip major and mode, and configures external port 9 as the
+fixed 1 Gbps RGMII-TXID CPU link.  It deliberately does not reset the whole
+switch or enable DSA tagging.
 
 The MDIO indirect-register protocol and register values were independently
 implemented from the behavior documented by the Linux `yt921x` driver by David

@@ -22,11 +22,35 @@
 #define YT921X_SWITCH_ID_MAX	3
 #define YT921X_SMI_ADDR_READ(id)	(((id) << 2) | 0x1)
 #define YT921X_SMI_DATA_READ(id)	(((id) << 2) | 0x3)
+#define YT921X_SMI_ADDR_WRITE(id)	((id) << 2)
+#define YT921X_SMI_DATA_WRITE(id)	(((id) << 2) | 0x2)
 
 #define YT921X_CHIP_ID		0x80008
 #define YT921X_CHIP_MODE	0x80388
 #define YT9215_CHIP_MAJOR	0x9002
 #define YT9215S_CHIP_MODE	2
+
+#define YT921X_SERDES_CTRL	0x80028
+#define YT921X_PORT9_CTRL	0x80124
+#define YT921X_PORT9_STATUS	0x80224
+#define YT921X_MDIO_POLLING9	0x80368
+#define YT921X_XMII_CTRL	0x80394
+#define YT921X_XMII9		0x80408
+#define YT921X_SERDES9		0x80090
+
+#define YT921X_SERDES_CTRL_PORT9	(1U << 1)
+#define YT921X_XMII_CTRL_PORT9	(1U << 0)
+#define YT921X_XMII_MODE_MASK	(7U << 29)
+#define YT921X_XMII_MODE_RGMII	(4U << 29)
+#define YT921X_XMII_LINK	(1U << 19)
+#define YT921X_XMII_ENABLE	(1U << 18)
+#define YT921X_XMII_TX_DELAY_MASK	(0xfU << 13)
+#define YT921X_XMII_TX_DELAY_2NS	(1U << 8)
+#define YT921X_XMII_RX_DELAY_MASK	(0xfU << 3)
+
+#define YT921X_PORT9_LINK_1G	0x000000fa
+#define YT921X_SERDES9_LINK_1G	0x0000007a
+#define YT921X_POLLING9_LINK_1G	0x0000001a
 
 struct yt921x_softc {
 	device_t	dev;
@@ -55,13 +79,12 @@ yt921x_find_node(device_t dev)
 }
 
 static int
-yt921x_read(struct yt921x_softc *sc, uint32_t reg, uint32_t *value)
+yt921x_read_locked(struct yt921x_softc *sc, uint32_t reg, uint32_t *value)
 {
 	device_t mdio;
 	int error, hi, lo;
 
 	mdio = device_get_parent(sc->dev);
-	mtx_lock(&sc->mtx);
 	error = MDIO_WRITEREG(mdio, sc->addr,
 	    YT921X_SMI_ADDR_READ(sc->switch_id), reg >> 16);
 	if (error == 0)
@@ -74,8 +97,123 @@ yt921x_read(struct yt921x_softc *sc, uint32_t reg, uint32_t *value)
 		    YT921X_SMI_DATA_READ(sc->switch_id));
 		*value = ((uint32_t)(hi & 0xffff) << 16) | (lo & 0xffff);
 	}
+	return (error);
+}
+
+static int
+yt921x_write_locked(struct yt921x_softc *sc, uint32_t reg, uint32_t value)
+{
+	device_t mdio;
+	int error;
+
+	mdio = device_get_parent(sc->dev);
+	error = MDIO_WRITEREG(mdio, sc->addr,
+	    YT921X_SMI_ADDR_WRITE(sc->switch_id), reg >> 16);
+	if (error == 0)
+		error = MDIO_WRITEREG(mdio, sc->addr,
+		    YT921X_SMI_ADDR_WRITE(sc->switch_id), reg & 0xffff);
+	if (error == 0)
+		error = MDIO_WRITEREG(mdio, sc->addr,
+		    YT921X_SMI_DATA_WRITE(sc->switch_id), value >> 16);
+	if (error == 0)
+		error = MDIO_WRITEREG(mdio, sc->addr,
+		    YT921X_SMI_DATA_WRITE(sc->switch_id), value & 0xffff);
+	return (error);
+}
+
+static int
+yt921x_read(struct yt921x_softc *sc, uint32_t reg, uint32_t *value)
+{
+	int error;
+
+	mtx_lock(&sc->mtx);
+	error = yt921x_read_locked(sc, reg, value);
 	mtx_unlock(&sc->mtx);
 	return (error);
+}
+
+static int
+yt921x_write(struct yt921x_softc *sc, uint32_t reg, uint32_t value)
+{
+	int error;
+
+	mtx_lock(&sc->mtx);
+	error = yt921x_write_locked(sc, reg, value);
+	mtx_unlock(&sc->mtx);
+	return (error);
+}
+
+static int
+yt921x_update(struct yt921x_softc *sc, uint32_t reg, uint32_t mask,
+    uint32_t value)
+{
+	uint32_t old;
+	int error;
+
+	mtx_lock(&sc->mtx);
+	error = yt921x_read_locked(sc, reg, &old);
+	if (error == 0 && (old & mask) != value)
+		error = yt921x_write_locked(sc, reg, (old & ~mask) | value);
+	mtx_unlock(&sc->mtx);
+	return (error);
+}
+
+static int
+yt921x_configure_port9(struct yt921x_softc *sc)
+{
+	uint32_t mask, value;
+	int error;
+
+	error = yt921x_update(sc, YT921X_SERDES_CTRL,
+	    YT921X_SERDES_CTRL_PORT9, 0);
+	if (error != 0)
+		return (error);
+	error = yt921x_update(sc, YT921X_XMII_CTRL,
+	    YT921X_XMII_CTRL_PORT9, YT921X_XMII_CTRL_PORT9);
+	if (error != 0)
+		return (error);
+	mask = YT921X_XMII_MODE_MASK | YT921X_XMII_ENABLE |
+	    YT921X_XMII_TX_DELAY_MASK | YT921X_XMII_TX_DELAY_2NS |
+	    YT921X_XMII_RX_DELAY_MASK;
+	value = YT921X_XMII_MODE_RGMII | YT921X_XMII_ENABLE |
+	    YT921X_XMII_TX_DELAY_2NS;
+	error = yt921x_update(sc, YT921X_XMII9, mask, value);
+	if (error != 0)
+		return (error);
+	error = yt921x_write(sc, YT921X_PORT9_CTRL, YT921X_PORT9_LINK_1G);
+	if (error != 0)
+		return (error);
+	error = yt921x_write(sc, YT921X_SERDES9, YT921X_SERDES9_LINK_1G);
+	if (error != 0)
+		return (error);
+	error = yt921x_update(sc, YT921X_XMII9,
+	    YT921X_XMII_LINK, YT921X_XMII_LINK);
+	if (error != 0)
+		return (error);
+	return (yt921x_write(sc, YT921X_MDIO_POLLING9,
+	    YT921X_POLLING9_LINK_1G));
+}
+
+static int
+yt921x_log_port9(struct yt921x_softc *sc)
+{
+	static const uint32_t regs[] = {
+		YT921X_SERDES_CTRL, YT921X_PORT9_CTRL, YT921X_PORT9_STATUS,
+		YT921X_MDIO_POLLING9, YT921X_XMII_CTRL, YT921X_XMII9,
+	};
+	uint32_t values[nitems(regs)];
+	int error;
+
+	for (u_int i = 0; i < nitems(regs); i++) {
+		error = yt921x_read(sc, regs[i], &values[i]);
+		if (error != 0)
+			return (error);
+	}
+	device_printf(sc->dev,
+	    "port 9 registers: serdes=%#x ctrl=%#x status=%#x "
+	    "poll=%#x xmii-ctrl=%#x xmii=%#x\n",
+	    values[0], values[1], values[2], values[3], values[4], values[5]);
+	return (0);
 }
 
 static void
@@ -140,6 +278,17 @@ yt921x_attach(device_t dev)
 	device_printf(dev,
 	    "YT9215S at MDIO address %#x, chip ID %#010x, mode %#x\n",
 	    sc->addr, chip_id, chip_mode);
+	error = yt921x_log_port9(sc);
+	if (error != 0)
+		device_printf(dev, "cannot read port 9 registers: %d\n", error);
+	error = yt921x_configure_port9(sc);
+	if (error != 0) {
+		device_printf(dev, "cannot configure port 9: %d\n", error);
+		mtx_destroy(&sc->mtx);
+		return (error);
+	}
+	device_printf(dev, "port 9 configured for RGMII-TXID at 1 Gbps\n");
+	yt921x_log_port9(sc);
 	return (0);
 }
 
