@@ -77,7 +77,7 @@
 #define YT921X_NPORTS		5
 #define YT921X_CPU_PORT		4
 #define YT921X_HW_CPU_PORT	9
-#define YT921X_VLANGROUPS	128
+#define YT921X_VLANGROUPS	4095
 #define YT921X_VID_MAX		4094
 #define YT921X_LOGICAL_PORTS	((1U << YT921X_NPORTS) - 1)
 #define YT921X_HW_PORTS		((1U << 1) | (1U << 2) | (1U << 3) | \
@@ -106,7 +106,7 @@ struct yt921x_softc {
 	int		addr;
 	int		switch_id;
 	etherswitch_info_t info;
-	uint16_t	vlans[YT921X_VLANGROUPS];
+	uint8_t		vlan_valid[YT921X_VLANGROUPS];
 };
 
 static int
@@ -716,21 +716,25 @@ yt921x_getvgroup(device_t dev, etherswitch_vlangroup_t *group)
 	group->es_member_ports = 0;
 	group->es_untagged_ports = 0;
 	group->es_fid = 0;
-	mtx_lock(&sc->mtx);
-	if ((sc->vlans[group->es_vlangroup] & ETHERSWITCH_VID_VALID) == 0) {
-		mtx_unlock(&sc->mtx);
+	vid = group->es_vlangroup;
+	if (vid == 0)
 		return (0);
-	}
-	vid = sc->vlans[group->es_vlangroup] & ETHERSWITCH_VID_MASK;
+	mtx_lock(&sc->mtx);
 	error = yt921x_read64_locked(sc, YT921X_VLAN_CTRL(vid), value);
-	mtx_unlock(&sc->mtx);
-	if (error != 0)
+	if (error == 0) {
+		member = (value[0] >> 7) & YT921X_FILTER_ALL_PORTS;
+		untagged = (value[1] >> 8) & YT921X_FILTER_ALL_PORTS;
+		if ((member & YT921X_HW_PORTS) != 0)
+			sc->vlan_valid[vid] = 1;
+	}
+	if (error != 0 || sc->vlan_valid[vid] == 0) {
+		mtx_unlock(&sc->mtx);
 		return (error);
-	member = (value[0] >> 7) & YT921X_FILTER_ALL_PORTS;
-	untagged = (value[1] >> 8) & YT921X_FILTER_ALL_PORTS;
+	}
 	group->es_vid = vid | ETHERSWITCH_VID_VALID;
 	group->es_member_ports = yt921x_ports_from_hw(member);
 	group->es_untagged_ports = yt921x_ports_from_hw(untagged);
+	mtx_unlock(&sc->mtx);
 	return (0);
 }
 
@@ -739,10 +743,10 @@ yt921x_setvgroup(device_t dev, etherswitch_vlangroup_t *group)
 {
 	struct yt921x_softc *sc;
 	uint32_t hw_member, hw_untagged, member, untagged;
-	uint32_t new_value[2], old_value[2], previous[2], cleared[2];
-	int error, oldvid, vid;
+	uint32_t new_value[2], old_value[2];
+	int error, vid;
 
-	if (group->es_vlangroup < 0 ||
+	if (group->es_vlangroup <= 0 ||
 	    group->es_vlangroup >= YT921X_VLANGROUPS)
 		return (EINVAL);
 	member = group->es_member_ports;
@@ -751,21 +755,10 @@ yt921x_setvgroup(device_t dev, etherswitch_vlangroup_t *group)
 	    (untagged & ~member) != 0)
 		return (EINVAL);
 	vid = group->es_vid & ETHERSWITCH_VID_MASK;
-	if (vid > YT921X_VID_MAX)
+	if (vid > YT921X_VID_MAX ||
+	    (vid != 0 && vid != group->es_vlangroup))
 		return (EINVAL);
 	sc = device_get_softc(dev);
-	mtx_lock(&sc->mtx);
-	oldvid = sc->vlans[group->es_vlangroup] & ETHERSWITCH_VID_MASK;
-	if ((sc->vlans[group->es_vlangroup] & ETHERSWITCH_VID_VALID) == 0)
-		oldvid = 0;
-	if (vid != 0) {
-		for (u_int i = 0; i < YT921X_VLANGROUPS; i++)
-			if (i != group->es_vlangroup &&
-			    sc->vlans[i] == (vid | ETHERSWITCH_VID_VALID)) {
-				error = EINVAL;
-				goto out;
-			}
-	}
 	if (vid == 0)
 		member = untagged = 0;
 	else if (member != 0)
@@ -774,42 +767,19 @@ yt921x_setvgroup(device_t dev, etherswitch_vlangroup_t *group)
 	hw_member = yt921x_ports_to_hw(member);
 	hw_untagged = yt921x_ports_to_hw(untagged);
 
-	error = 0;
-	if (vid != 0) {
-		error = yt921x_read64_locked(sc, YT921X_VLAN_CTRL(vid),
-		    old_value);
-		if (error != 0)
-			goto out;
+	mtx_lock(&sc->mtx);
+	error = yt921x_read64_locked(sc,
+	    YT921X_VLAN_CTRL(group->es_vlangroup), old_value);
+	if (error == 0) {
 		new_value[0] = (old_value[0] & ~YT921X_VLAN_MEMBER_MASK) |
 		    (hw_member << 7);
 		new_value[1] = (old_value[1] & ~YT921X_VLAN_UNTAG_MASK) |
 		    (hw_untagged << 8);
-		error = yt921x_write64_verify_locked(sc, YT921X_VLAN_CTRL(vid),
-		    old_value, new_value);
-		if (error != 0)
-			goto out;
-	}
-	if (oldvid != 0 && oldvid != vid) {
-		error = yt921x_read64_locked(sc, YT921X_VLAN_CTRL(oldvid),
-		    previous);
-		if (error != 0)
-			goto rollback_new;
-		cleared[0] = previous[0] & ~YT921X_VLAN_MEMBER_MASK;
-		cleared[1] = previous[1] & ~YT921X_VLAN_UNTAG_MASK;
 		error = yt921x_write64_verify_locked(sc,
-		    YT921X_VLAN_CTRL(oldvid), previous, cleared);
-		if (error != 0)
-			goto rollback_new;
+		    YT921X_VLAN_CTRL(group->es_vlangroup), old_value, new_value);
 	}
-	sc->vlans[group->es_vlangroup] = vid == 0 ? 0 :
-	    vid | ETHERSWITCH_VID_VALID;
-	goto out;
-
-rollback_new:
-	if (vid != 0)
-		(void)yt921x_write64_locked(sc, YT921X_VLAN_CTRL(vid),
-		    old_value);
-out:
+	if (error == 0)
+		sc->vlan_valid[group->es_vlangroup] = vid != 0;
 	mtx_unlock(&sc->mtx);
 	return (error);
 }

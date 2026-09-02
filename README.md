@@ -9,22 +9,23 @@ switch or enable DSA tagging.
 
 Each chip is also exposed through FreeBSD's native `etherswitch(4)` interface
 as four user ports plus one fixed CPU port.  The driver reports real PVID and
-ingress-filter state and supports 128 software VLAN groups mapped to hardware
-VIDs 1 through 4094.  VLAN membership, tagged/untagged membership, PVID, and
-tagged/untagged ingress rules are programmable; media changes are not.
+ingress-filter state and exposes the hardware's VID-indexed groups 1 through
+4094 (`vlangroupN` is VID N).  VLAN membership, tagged/untagged membership,
+PVID, and tagged/untagged ingress rules are programmable; media changes are
+not.
 
 The CPU port is logical port 4.  It is automatically retained as a tagged
 member whenever a VLAN has members, so normal FreeBSD `vlan(4)` traffic can
 reach the switch without the proprietary YT921x DSA tag:
 
 ```sh
-etherswitchcfg -f /dev/etherswitch0 vlangroup1 vlan 100 members 0,4t
+etherswitchcfg -f /dev/etherswitch0 vlangroup100 vlan 100 members 0,4t
 etherswitchcfg -f /dev/etherswitch0 port0 pvid 100 ingress
 ```
 
 The driver does not reset the switch or replace its power-on forwarding setup.
-Only VLAN groups configured during the current module lifetime are listed;
-remove a group with `vlan 0` before unloading the module.
+VLAN state is read directly from the hardware table, so populated groups remain
+discoverable after a module reattach.  Remove a group with `vlan 0`.
 
 The MDIO indirect-register protocol and register values were independently
 implemented from the behavior documented by the Linux `yt921x` driver by David
