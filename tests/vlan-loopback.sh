@@ -24,10 +24,18 @@ port=${7:-0}
 }
 hwport=$(( port + 1 ))
 capture_timeout=${CAPTURE_TIMEOUT:-5}
+ping_payload=${PING_PAYLOAD:-}
 esc="etherswitchcfg -f $dev"
 iface=vlan$outvid
 mode_enabled=0
 parent_was_up=0
+probe_filter="vlan $invid and arp"
+probe_size=
+
+if [ -n "$ping_payload" ]; then
+	probe_filter="vlan $invid and icmp"
+	probe_size="-s $ping_payload"
+fi
 
 reg()
 {
@@ -117,10 +125,10 @@ arp -d "$target" >/dev/null 2>&1 || true
 set +e
 capture=$(
 	timeout "$capture_timeout" tcpdump -ln -e -Q in -i "$parent" -c 1 \
-	    "vlan $invid and arp" 2>&1 &
+	    "$probe_filter" 2>&1 &
 	tcpdump_pid=$!
 	sleep 1
-	ping -c 1 -W 1000 -S "$source" "$target" || true
+	ping -c 1 -W 1000 $probe_size -S "$source" "$target" || true
 	wait "$tcpdump_pid"
 )
 status=$?
@@ -134,10 +142,11 @@ arp -d "$target" >/dev/null 2>&1 || true
 set +e
 capture=$(
 	timeout 3 tcpdump -ln -e -i "$parent" -Q in -c 1 \
-	    "vlan $invid and arp" 2>&1 &
+	    "$probe_filter" 2>&1 &
 	tcpdump_pid=$!
 	sleep 1
-	ping -c 1 -W 1000 -S "$source" "$target" >/dev/null 2>&1 || true
+	ping -c 1 -W 1000 $probe_size -S "$source" "$target" \
+	    >/dev/null 2>&1 || true
 	wait "$tcpdump_pid"
 )
 status=$?
