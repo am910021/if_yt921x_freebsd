@@ -34,6 +34,11 @@
 #define YT921X_CHIP_ID		0x80008
 #define YT921X_EXT_CPU_PORT	0x8000c
 #define YT921X_CHIP_MODE	0x80388
+#define YT921X_RESET		0x80000
+#define YT921X_RESET_HW		(1U << 31)
+#define YT921X_RESET_DELAY_US	10000
+#define YT921X_RESET_POLL_US	100
+#define YT921X_RESET_RETRIES	1000
 #define YT9215_CHIP_MAJOR	0x9002
 #define YT9215S_CHIP_MODE	2
 
@@ -52,7 +57,10 @@
 #define YT921X_FILTER_UNK_MCAST	0x18050c
 #define YT921X_CPU_COPY		0x180690
 #define YT921X_VLAN_IGR_FILTER	0x180280
+#define YT921X_STP0		0x18038c
 #define YT921X_VLAN_CTRL(vid)	(0x188000 + 8 * (vid))
+#define YT921X_EGR_VLAN_CTRL(port)	(0x100080 + 4 * (port))
+#define YT921X_TPID_EGR0	0x100300
 #define YT921X_PORT_IGR_TPID(port)	(0x210010 + 4 * (port))
 #define YT921X_PORT_VLAN_CTRL(port)	(0x230010 + 4 * (port))
 #define YT921X_PORT_VLAN_CTRL1(port)	(0x230080 + 4 * (port))
@@ -90,6 +98,13 @@
 #define YT921X_PORT_DROP_TAGGED	(1U << 1)
 #define YT921X_PORT_CTAG_MASK	0xfU
 #define YT921X_PORT_CTAG_8100	(1U << 0)
+#define YT921X_EGR_CTAG_MODE_MASK	(7U << 12)
+#define YT921X_EGR_CTAG_ENTRY_BASED	(5U << 12)
+#define YT921X_TPID_MASK	0xffffU
+#define YT921X_TPID_8021Q	0x8100U
+#define YT921X_STP_PORT_MASK(port)	(3U << (2 * (port)))
+#define YT921X_STP_PORT_FORWARD(port)	(3U << (2 * (port)))
+#define YT921X_VLAN_POLICY_REGS	(YT921X_NPORTS + 2)
 
 #define YT921X_MBUS_START	(1U << 0)
 #define YT921X_MBUS_PORT_MASK	(0x1fU << 21)
@@ -106,6 +121,8 @@ struct yt921x_softc {
 	int		addr;
 	int		switch_id;
 	etherswitch_info_t info;
+	int		vlan_mode;
+	uint32_t	vlan_policy_old[YT921X_VLAN_POLICY_REGS];
 	uint8_t		vlan_valid[YT921X_VLANGROUPS];
 };
 
@@ -250,6 +267,25 @@ yt921x_update(struct yt921x_softc *sc, uint32_t reg, uint32_t mask,
 }
 
 static int
+yt921x_reset(struct yt921x_softc *sc)
+{
+	uint32_t value;
+	int error;
+
+	error = yt921x_write(sc, YT921X_RESET, YT921X_RESET_HW);
+	if (error != 0)
+		return (error);
+	DELAY(YT921X_RESET_DELAY_US);
+	for (u_int retry = 0; retry < YT921X_RESET_RETRIES; retry++) {
+		error = yt921x_read(sc, YT921X_RESET, &value);
+		if (error != 0 || value == 0)
+			return (error);
+		DELAY(YT921X_RESET_POLL_US);
+	}
+	return (ETIMEDOUT);
+}
+
+static int
 yt921x_read64_locked(struct yt921x_softc *sc, uint32_t reg,
     uint32_t value[2])
 {
@@ -288,6 +324,76 @@ yt921x_write64_verify_locked(struct yt921x_softc *sc, uint32_t reg,
 		return (0);
 	(void)yt921x_write64_locked(sc, reg, old);
 	return (error != 0 ? error : EIO);
+}
+
+static int
+yt921x_set_vlan_mode_locked(struct yt921x_softc *sc, int mode)
+{
+	uint32_t check, current[YT921X_VLAN_POLICY_REGS];
+	uint32_t mask[YT921X_VLAN_POLICY_REGS];
+	uint32_t reg[YT921X_VLAN_POLICY_REGS];
+	uint32_t value[YT921X_VLAN_POLICY_REGS];
+	int error;
+
+	if (mode != 0 && mode != ETHERSWITCH_VLAN_DOT1Q)
+		return (EINVAL);
+	if (mode == sc->vlan_mode)
+		return (0);
+
+	for (u_int port = 0; port < YT921X_NPORTS; port++) {
+		int hwport;
+
+		hwport = yt921x_hwport(port);
+		reg[port] = YT921X_EGR_VLAN_CTRL(hwport);
+		mask[port] = YT921X_EGR_CTAG_MODE_MASK;
+		value[port] = YT921X_EGR_CTAG_ENTRY_BASED;
+	}
+	reg[YT921X_NPORTS] = YT921X_TPID_EGR0;
+	mask[YT921X_NPORTS] = YT921X_TPID_MASK;
+	value[YT921X_NPORTS] = YT921X_TPID_8021Q;
+	reg[YT921X_NPORTS + 1] = YT921X_STP0;
+	mask[YT921X_NPORTS + 1] = 0;
+	value[YT921X_NPORTS + 1] = 0;
+	for (u_int port = 0; port < YT921X_NPORTS; port++) {
+		int hwport;
+
+		hwport = yt921x_hwport(port);
+		mask[YT921X_NPORTS + 1] |= YT921X_STP_PORT_MASK(hwport);
+		value[YT921X_NPORTS + 1] |= YT921X_STP_PORT_FORWARD(hwport);
+	}
+
+	for (u_int i = 0; i < nitems(reg); i++) {
+		error = yt921x_read_locked(sc, reg[i], &current[i]);
+		if (error != 0)
+			return (error);
+		if (mode == ETHERSWITCH_VLAN_DOT1Q)
+			sc->vlan_policy_old[i] = current[i];
+		else
+			value[i] = sc->vlan_policy_old[i];
+		value[i] = (current[i] & ~mask[i]) | (value[i] & mask[i]);
+	}
+	for (u_int i = 0; i < nitems(reg); i++) {
+		if (value[i] != current[i]) {
+			error = yt921x_write_locked(sc, reg[i], value[i]);
+			if (error != 0)
+				goto rollback;
+		}
+	}
+	for (u_int i = 0; i < nitems(reg); i++) {
+		error = yt921x_read_locked(sc, reg[i], &check);
+		if (error != 0 || check != value[i]) {
+			if (error == 0)
+				error = EIO;
+			goto rollback;
+		}
+	}
+	sc->vlan_mode = mode;
+	return (0);
+
+rollback:
+	for (u_int i = 0; i < nitems(reg); i++)
+		(void)yt921x_write_locked(sc, reg[i], current[i]);
+	return (error);
 }
 
 static int
@@ -624,6 +730,10 @@ yt921x_setport(device_t dev, etherswitch_port_t *port)
 	hwport = yt921x_hwport(port->es_port);
 	sc = device_get_softc(dev);
 	mtx_lock(&sc->mtx);
+	if (sc->vlan_mode != ETHERSWITCH_VLAN_DOT1Q) {
+		error = EOPNOTSUPP;
+		goto out;
+	}
 	error = yt921x_read_locked(sc, YT921X_PORT_VLAN_CTRL(hwport), &vlan);
 	if (error == 0)
 		error = yt921x_read_locked(sc, YT921X_PORT_VLAN_CTRL1(hwport),
@@ -768,6 +878,10 @@ yt921x_setvgroup(device_t dev, etherswitch_vlangroup_t *group)
 	hw_untagged = yt921x_ports_to_hw(untagged);
 
 	mtx_lock(&sc->mtx);
+	if (sc->vlan_mode != ETHERSWITCH_VLAN_DOT1Q) {
+		error = EOPNOTSUPP;
+		goto out;
+	}
 	error = yt921x_read64_locked(sc,
 	    YT921X_VLAN_CTRL(group->es_vlangroup), old_value);
 	if (error == 0) {
@@ -780,6 +894,7 @@ yt921x_setvgroup(device_t dev, etherswitch_vlangroup_t *group)
 	}
 	if (error == 0)
 		sc->vlan_valid[group->es_vlangroup] = vid != 0;
+out:
 	mtx_unlock(&sc->mtx);
 	return (error);
 }
@@ -787,20 +902,29 @@ yt921x_setvgroup(device_t dev, etherswitch_vlangroup_t *group)
 static int
 yt921x_getconf(device_t dev, etherswitch_conf_t *conf)
 {
+	struct yt921x_softc *sc;
 
+	sc = device_get_softc(dev);
 	conf->cmd = ETHERSWITCH_CONF_VLAN_MODE;
-	conf->vlan_mode = ETHERSWITCH_VLAN_DOT1Q;
+	mtx_lock(&sc->mtx);
+	conf->vlan_mode = sc->vlan_mode;
+	mtx_unlock(&sc->mtx);
 	return (0);
 }
 
 static int
 yt921x_setconf(device_t dev, etherswitch_conf_t *conf)
 {
+	struct yt921x_softc *sc;
+	int error;
 
-	if ((conf->cmd & ETHERSWITCH_CONF_VLAN_MODE) != 0 &&
-	    conf->vlan_mode != ETHERSWITCH_VLAN_DOT1Q)
-		return (EINVAL);
-	return (0);
+	if ((conf->cmd & ETHERSWITCH_CONF_VLAN_MODE) == 0)
+		return (0);
+	sc = device_get_softc(dev);
+	mtx_lock(&sc->mtx);
+	error = yt921x_set_vlan_mode_locked(sc, conf->vlan_mode);
+	mtx_unlock(&sc->mtx);
+	return (error);
 }
 
 static void
@@ -871,6 +995,12 @@ yt921x_attach(device_t dev)
 	device_printf(dev,
 	    "YT9215S at MDIO address %#x, chip ID %#010x, mode %#x\n",
 	    sc->addr, chip_id, chip_mode);
+	error = yt921x_reset(sc);
+	if (error != 0) {
+		device_printf(dev, "cannot reset switch: %d\n", error);
+		mtx_destroy(&sc->mtx);
+		return (error);
+	}
 	error = yt921x_log_port9(sc);
 	if (error != 0)
 		device_printf(dev, "cannot read port 9 registers: %d\n", error);
@@ -892,9 +1022,17 @@ static int
 yt921x_detach(device_t dev)
 {
 	struct yt921x_softc *sc;
+	int error;
 
 	sc = device_get_softc(dev);
-	bus_generic_detach(dev);
+	mtx_lock(&sc->mtx);
+	error = yt921x_set_vlan_mode_locked(sc, 0);
+	mtx_unlock(&sc->mtx);
+	if (error != 0)
+		return (error);
+	error = bus_generic_detach(dev);
+	if (error != 0)
+		return (error);
 	mtx_destroy(&sc->mtx);
 	return (0);
 }
