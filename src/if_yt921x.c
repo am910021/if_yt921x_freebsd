@@ -37,6 +37,9 @@
 #define YT921X_XMII_CTRL	0x80394
 #define YT921X_XMII9		0x80408
 #define YT921X_SERDES9		0x80090
+#define YT921X_INT_MBUS_OP	0xf0000
+#define YT921X_INT_MBUS_CTRL	0xf0004
+#define YT921X_INT_MBUS_DIN	0xf000c
 
 #define YT921X_SERDES_CTRL_PORT9	(1U << 1)
 #define YT921X_XMII_CTRL_PORT9	(1U << 0)
@@ -51,6 +54,14 @@
 #define YT921X_PORT9_LINK_1G	0x000000fa
 #define YT921X_SERDES9_LINK_1G	0x0000007a
 #define YT921X_POLLING9_LINK_1G	0x0000001a
+
+#define YT921X_MBUS_START	(1U << 0)
+#define YT921X_MBUS_PORT_MASK	(0x1fU << 21)
+#define YT921X_MBUS_PORT(port)	((uint32_t)(port) << 21)
+#define YT921X_MBUS_REG_MASK	(0x1fU << 16)
+#define YT921X_MBUS_REG(reg)	((uint32_t)(reg) << 16)
+#define YT921X_MBUS_OP_MASK	(3U << 2)
+#define YT921X_MBUS_READ	(2U << 2)
 
 struct yt921x_softc {
 	device_t	dev;
@@ -144,16 +155,26 @@ yt921x_write(struct yt921x_softc *sc, uint32_t reg, uint32_t value)
 }
 
 static int
-yt921x_update(struct yt921x_softc *sc, uint32_t reg, uint32_t mask,
+yt921x_update_locked(struct yt921x_softc *sc, uint32_t reg, uint32_t mask,
     uint32_t value)
 {
 	uint32_t old;
 	int error;
 
-	mtx_lock(&sc->mtx);
 	error = yt921x_read_locked(sc, reg, &old);
 	if (error == 0 && (old & mask) != value)
 		error = yt921x_write_locked(sc, reg, (old & ~mask) | value);
+	return (error);
+}
+
+static int
+yt921x_update(struct yt921x_softc *sc, uint32_t reg, uint32_t mask,
+    uint32_t value)
+{
+	int error;
+
+	mtx_lock(&sc->mtx);
+	error = yt921x_update_locked(sc, reg, mask, value);
 	mtx_unlock(&sc->mtx);
 	return (error);
 }
@@ -214,6 +235,82 @@ yt921x_log_port9(struct yt921x_softc *sc)
 	    "poll=%#x xmii-ctrl=%#x xmii=%#x\n",
 	    values[0], values[1], values[2], values[3], values[4], values[5]);
 	return (0);
+}
+
+static void
+yt921x_log_user_ports(struct yt921x_softc *sc)
+{
+	uint32_t status;
+	int error;
+
+	for (u_int port = 1; port <= 4; port++) {
+		error = yt921x_read(sc, 0x80200 + 4 * port, &status);
+		if (error == 0)
+			device_printf(sc->dev, "port %u status=%#x%s\n", port,
+			    status, (status & (1U << 9)) != 0 ? " link" : "");
+	}
+}
+
+static int
+yt921x_mbus_wait_locked(struct yt921x_softc *sc)
+{
+	uint32_t value;
+	int error;
+
+	for (u_int retry = 0; retry < 10000; retry++) {
+		error = yt921x_read_locked(sc, YT921X_INT_MBUS_OP, &value);
+		if (error != 0 || (value & YT921X_MBUS_START) == 0)
+			return (error);
+		DELAY(10);
+	}
+	return (ETIMEDOUT);
+}
+
+static int
+yt921x_phy_read(struct yt921x_softc *sc, int port, int reg, uint16_t *value)
+{
+	uint32_t ctrl, data, mask;
+	int error;
+
+	mask = YT921X_MBUS_PORT_MASK | YT921X_MBUS_REG_MASK |
+	    YT921X_MBUS_OP_MASK;
+	ctrl = YT921X_MBUS_PORT(port) | YT921X_MBUS_REG(reg) |
+	    YT921X_MBUS_READ;
+	mtx_lock(&sc->mtx);
+	error = yt921x_mbus_wait_locked(sc);
+	if (error == 0)
+		error = yt921x_update_locked(sc, YT921X_INT_MBUS_CTRL,
+		    mask, ctrl);
+	if (error == 0)
+		error = yt921x_write_locked(sc, YT921X_INT_MBUS_OP,
+		    YT921X_MBUS_START);
+	if (error == 0)
+		error = yt921x_mbus_wait_locked(sc);
+	if (error == 0)
+		error = yt921x_read_locked(sc, YT921X_INT_MBUS_DIN, &data);
+	mtx_unlock(&sc->mtx);
+	if (error == 0)
+		*value = data;
+	return (error);
+}
+
+static void
+yt921x_log_phys(struct yt921x_softc *sc)
+{
+	uint16_t id1, id2;
+	int error;
+
+	for (u_int port = 1; port <= 4; port++) {
+		error = yt921x_phy_read(sc, port, 2, &id1);
+		if (error == 0)
+			error = yt921x_phy_read(sc, port, 3, &id2);
+		if (error == 0)
+			device_printf(sc->dev, "port %u PHY ID %#04x:%#04x\n",
+			    port, id1, id2);
+		else
+			device_printf(sc->dev, "cannot read port %u PHY: %d\n",
+			    port, error);
+	}
 }
 
 static void
@@ -289,6 +386,8 @@ yt921x_attach(device_t dev)
 	}
 	device_printf(dev, "port 9 configured for RGMII-TXID at 1 Gbps\n");
 	yt921x_log_port9(sc);
+	yt921x_log_user_ports(sc);
+	yt921x_log_phys(sc);
 	return (0);
 }
 
