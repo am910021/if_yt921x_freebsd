@@ -56,7 +56,6 @@
 #define YT921X_INT_MBUS_DIN	0xf000c
 #define YT921X_FILTER_UNK_UCAST	0x180508
 #define YT921X_FILTER_UNK_MCAST	0x18050c
-#define YT921X_ACT_UNK_MCAST	0x180738
 #define YT921X_CPU_COPY		0x180690
 #define YT921X_VLAN_IGR_FILTER	0x180280
 #define YT921X_STP0		0x18038c
@@ -82,12 +81,7 @@
 #define YT921X_POLLING9_LINK_1G	0x0000001a
 #define YT921X_EXT_CPU_PORT9	0x00004009
 #define YT921X_CPU_COPY_TO_EXT	0x00000001
-#define YT921X_FILTER_ALL_PORTS	0x000007ff
-#define YT921X_ACT_COPY(port)	(3U << (2 * (port)))
-#define YT921X_ACT_COPY_USER_PORTS	(YT921X_ACT_COPY(1) | \
-					 YT921X_ACT_COPY(2) | \
-					 YT921X_ACT_COPY(3) | \
-					 YT921X_ACT_COPY(4))
+#define YT921X_FILTER_INTERNAL_CPU	(1U << 10)
 
 #define YT921X_NPORTS		5
 #define YT921X_CPU_PORT		4
@@ -417,16 +411,11 @@ yt921x_configure_port9(struct yt921x_softc *sc)
 	if (error != 0)
 		return (error);
 	error = yt921x_write(sc, YT921X_FILTER_UNK_UCAST,
-	    YT921X_FILTER_ALL_PORTS);
+	    YT921X_FILTER_INTERNAL_CPU);
 	if (error != 0)
 		return (error);
 	error = yt921x_write(sc, YT921X_FILTER_UNK_MCAST,
-	    YT921X_FILTER_ALL_PORTS);
-	if (error != 0)
-		return (error);
-	/* Preserve hardware flooding and copy unknown multicast to the CPU. */
-	error = yt921x_update(sc, YT921X_ACT_UNK_MCAST,
-	    YT921X_ACT_COPY_USER_PORTS, YT921X_ACT_COPY_USER_PORTS);
+	    YT921X_FILTER_INTERNAL_CPU);
 	if (error != 0)
 		return (error);
 	error = yt921x_update(sc, YT921X_SERDES_CTRL,
@@ -850,8 +839,8 @@ yt921x_getvgroup(device_t dev, etherswitch_vlangroup_t *group)
 	mtx_lock(&sc->mtx);
 	error = yt921x_read64_locked(sc, YT921X_VLAN_CTRL(vid), value);
 	if (error == 0) {
-		member = (value[0] >> 7) & YT921X_FILTER_ALL_PORTS;
-		untagged = (value[1] >> 8) & YT921X_FILTER_ALL_PORTS;
+		member = (value[0] >> 7) & YT921X_HW_PORTS;
+		untagged = (value[1] >> 8) & YT921X_HW_PORTS;
 		if ((member & YT921X_HW_PORTS) != 0)
 			sc->vlan_valid[vid] = 1;
 	}
