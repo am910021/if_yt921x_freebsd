@@ -11,6 +11,7 @@
 #include <sys/module.h>
 #include <sys/mutex.h>
 #include <sys/socket.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
 
 #include <net/if.h>
@@ -115,6 +116,67 @@
 #define YT921X_MBUS_OP_MASK	(3U << 2)
 #define YT921X_MBUS_WRITE	(1U << 2)
 #define YT921X_MBUS_READ	(2U << 2)
+
+#define YT921X_FUNC		0x80004
+#define YT921X_FUNC_MIB		(1U << 1)
+#define YT921X_MIB_BASE(port)	(0xc0100 + 0x100 * (port))
+
+struct yt921x_mib_desc {
+	const char	*name;
+	uint8_t		size;
+	uint8_t		offset;
+};
+
+#define YT921X_MIB(_name, _size, _offset) { #_name, _size, _offset }
+
+/*
+ * YT9215S hardware MIB layout.  Register offsets were verified against the
+ * Motorcomm switch SDK and Linux drivers/net/dsa/yt921x.{c,h}; the sysctl
+ * implementation is FreeBSD-specific.
+ * ponytail: expose raw counters; add periodic 64-bit accumulation only if
+ * monitoring across a 32-bit hardware wrap becomes a requirement.
+ */
+static const struct yt921x_mib_desc yt921x_mibs[] = {
+	YT921X_MIB(rx_broadcast, 1, 0x00),
+	YT921X_MIB(rx_pause, 1, 0x04),
+	YT921X_MIB(rx_multicast, 1, 0x08),
+	YT921X_MIB(rx_crc_errors, 1, 0x0c),
+	YT921X_MIB(rx_alignment_errors, 1, 0x10),
+	YT921X_MIB(rx_undersize, 1, 0x14),
+	YT921X_MIB(rx_fragments, 1, 0x18),
+	YT921X_MIB(rx_64, 1, 0x1c),
+	YT921X_MIB(rx_65_127, 1, 0x20),
+	YT921X_MIB(rx_128_255, 1, 0x24),
+	YT921X_MIB(rx_256_511, 1, 0x28),
+	YT921X_MIB(rx_512_1023, 1, 0x2c),
+	YT921X_MIB(rx_1024_1518, 1, 0x30),
+	YT921X_MIB(rx_jumbo, 1, 0x34),
+	YT921X_MIB(rx_good_bytes, 2, 0x3c),
+	YT921X_MIB(rx_bad_bytes, 2, 0x44),
+	YT921X_MIB(rx_oversize, 1, 0x4c),
+	YT921X_MIB(rx_dropped, 1, 0x50),
+	YT921X_MIB(tx_broadcast, 1, 0x54),
+	YT921X_MIB(tx_pause, 1, 0x58),
+	YT921X_MIB(tx_multicast, 1, 0x5c),
+	YT921X_MIB(tx_undersize, 1, 0x60),
+	YT921X_MIB(tx_64, 1, 0x64),
+	YT921X_MIB(tx_65_127, 1, 0x68),
+	YT921X_MIB(tx_128_255, 1, 0x6c),
+	YT921X_MIB(tx_256_511, 1, 0x70),
+	YT921X_MIB(tx_512_1023, 1, 0x74),
+	YT921X_MIB(tx_1024_1518, 1, 0x78),
+	YT921X_MIB(tx_jumbo, 1, 0x7c),
+	YT921X_MIB(tx_good_bytes, 2, 0x84),
+	YT921X_MIB(tx_collisions, 1, 0x8c),
+	YT921X_MIB(tx_excessive_collisions, 1, 0x90),
+	YT921X_MIB(tx_multiple_collisions, 1, 0x94),
+	YT921X_MIB(tx_single_collisions, 1, 0x98),
+	YT921X_MIB(tx_packets, 1, 0x9c),
+	YT921X_MIB(tx_deferred, 1, 0xa0),
+	YT921X_MIB(tx_late_collisions, 1, 0xa4),
+	YT921X_MIB(rx_oam, 1, 0xa8),
+	YT921X_MIB(tx_oam, 1, 0xac),
+};
 
 struct yt921x_softc {
 	device_t	dev;
@@ -325,6 +387,65 @@ yt921x_write64_verify_locked(struct yt921x_softc *sc, uint32_t reg,
 		return (0);
 	(void)yt921x_write64_locked(sc, reg, old);
 	return (error != 0 ? error : EIO);
+}
+
+static int
+yt921x_sysctl_mib(SYSCTL_HANDLER_ARGS)
+{
+	const struct yt921x_mib_desc *desc;
+	struct yt921x_softc *sc;
+	uint32_t value[2];
+	uint64_t counter;
+	u_int index, port;
+	int error;
+
+	sc = arg1;
+	port = arg2 / nitems(yt921x_mibs);
+	index = arg2 % nitems(yt921x_mibs);
+	if (port >= YT921X_NPORTS)
+		return (EINVAL);
+	desc = &yt921x_mibs[index];
+
+	mtx_lock(&sc->mtx);
+	value[1] = 0;
+	if (desc->size == 2)
+		error = yt921x_read64_locked(sc,
+		    YT921X_MIB_BASE(yt921x_hwport(port)) + desc->offset, value);
+	else
+		error = yt921x_read_locked(sc,
+		    YT921X_MIB_BASE(yt921x_hwport(port)) + desc->offset,
+		    &value[0]);
+	mtx_unlock(&sc->mtx);
+	if (error != 0)
+		return (error);
+
+	counter = ((uint64_t)value[1] << 32) | value[0];
+	return (sysctl_handle_64(oidp, &counter, 0, req));
+}
+
+static void
+yt921x_sysctl_attach(struct yt921x_softc *sc)
+{
+	struct sysctl_ctx_list *ctx;
+	struct sysctl_oid *mib, *node;
+	struct sysctl_oid_list *children;
+	char name[16];
+
+	ctx = device_get_sysctl_ctx(sc->dev);
+	children = SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev));
+	mib = SYSCTL_ADD_NODE(ctx, children, OID_AUTO, "mib",
+	    CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, "Hardware MIB counters");
+	for (u_int port = 0; port < YT921X_NPORTS; port++) {
+		snprintf(name, sizeof(name), "port%u", port);
+		node = SYSCTL_ADD_NODE(ctx, SYSCTL_CHILDREN(mib), OID_AUTO, name,
+		    CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
+		    port == YT921X_CPU_PORT ? "CPU port 9" : "User port");
+		for (u_int i = 0; i < nitems(yt921x_mibs); i++)
+			SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(node), OID_AUTO,
+			    yt921x_mibs[i].name, CTLTYPE_U64 | CTLFLAG_RD |
+			    CTLFLAG_MPSAFE, sc, port * nitems(yt921x_mibs) + i,
+			    yt921x_sysctl_mib, "QU", "Hardware MIB counter");
+	}
 }
 
 static int
@@ -1017,6 +1138,14 @@ yt921x_attach(device_t dev)
 		mtx_destroy(&sc->mtx);
 		return (error);
 	}
+	error = yt921x_update(sc, YT921X_FUNC, YT921X_FUNC_MIB,
+	    YT921X_FUNC_MIB);
+	if (error != 0) {
+		device_printf(dev, "cannot enable MIB counters: %d\n", error);
+		mtx_destroy(&sc->mtx);
+		return (error);
+	}
+	yt921x_sysctl_attach(sc);
 	device_printf(dev, "port 9 configured for RGMII-TXID at 1 Gbps\n");
 	yt921x_log_port9(sc);
 	yt921x_log_user_ports(sc);

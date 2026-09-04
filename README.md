@@ -29,6 +29,19 @@ etherswitchcfg -f /dev/etherswitch0 port0 pvid 100 ingress
 etherswitchcfg -f /dev/etherswitch0 config vlan_mode none
 ```
 
+The driver enables the switch MIB block and exposes live, read-only hardware
+counters for four user ports plus logical CPU port 4 (hardware port 9):
+
+```sh
+sysctl dev.yt921x.0.mib.port0
+sysctl dev.yt921x.0.mib.port4.rx_good_bytes
+```
+
+The MIB register layout was verified against the Motorcomm YT9215 switch SDK
+and Linux `drivers/net/dsa/yt921x.{c,h}`.  Byte counters are native 64-bit
+hardware values; packet and error counters are raw 32-bit hardware values and
+restart when the switch is reset.
+
 Attach resets the switch and therefore clears firmware or stale VLAN state.
 While loaded, VLAN state is read directly from the hardware table.  Remove a
 group with `vlan 0`.
