@@ -4,10 +4,11 @@ The G98 connects two YT9215S switches to the RK3588 through `eqos0` and
 `eqos1`. The driver exposes the switch ports through `etherswitch(4)`; it does
 not create DSA-style `lan1` through `lan8` interfaces.
 
-The supported design assigns one access VLAN to each physical RJ45 socket.
-The external port is untagged, while logical CPU port 4 is a tagged member.
-FreeBSD therefore sees each socket through a standard `vlan(4)` interface on
-the corresponding EQOS parent.
+The supported design assigns an access VLAN to each physical RJ45 socket.
+Repeating a VLAN ID groups those sockets in one hardware-switched network. The
+external ports are untagged, while logical CPU port 4 is a tagged member.
+FreeBSD therefore sees each VLAN group through one standard `vlan(4)`
+interface on the corresponding EQOS parent.
 
 ## Persistent configuration
 
@@ -43,6 +44,33 @@ These are `rc.conf` variables, not commands executed in sequence:
 | `vlans_eqos0="..."` and `vlans_eqos1="..."` | Tell the standard FreeBSD network startup code which `vlan(4)` interfaces to create on each EQOS parent. |
 | `create_args_vlanN="vlan N"` | Assign the actual IEEE 802.1Q VLAN ID to each named `vlan(4)` interface. The interface name alone does not define its VLAN ID. |
 | `ifconfig_vlanN="..."` | Optionally assigns layer-3 addresses or other normal interface settings. OPNsense can manage this part instead. |
+
+## Grouped ports
+
+Repeat a VLAN ID to place multiple physical ports in the same hardware VLAN.
+List each unique VLAN only once in `vlans_eqosN`, so each group appears as one
+FreeBSD interface.
+
+For two isolated pairs on `lan8` through `lan5`:
+
+```sh
+yt921x_config_switches="etherswitch0:101,101,103,103"
+ifconfig_eqos0="up"
+vlans_eqos0="vlan101 vlan103"
+create_args_vlan101="vlan 101"
+create_args_vlan103="vlan 103"
+```
+
+This creates the following topology:
+
+| FreeBSD interface | Hardware VLAN members | G98 sockets |
+|---|---|---|
+| `vlan101` | switch ports 0, 1 and tagged CPU port 4 | `lan8`, `lan7` |
+| `vlan103` | switch ports 2, 3 and tagged CPU port 4 | `lan6`, `lan5` |
+
+A mixed grouping uses the same syntax. For example,
+`etherswitch0:101,102,102,104` creates three FreeBSD VLAN interfaces: one for
+`lan8`, one shared by `lan7` and `lan6`, and one for `lan5`.
 
 For example, an untagged frame entering G98 `lan8` is assigned PVID 101 by
 YT9215S port 0. The switch sends it tagged through CPU port 4 and `eqos0`;
