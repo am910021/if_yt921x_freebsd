@@ -42,6 +42,10 @@ and Linux `drivers/net/dsa/yt921x.{c,h}`.  Byte counters are native 64-bit
 hardware values; packet and error counters are raw 32-bit hardware values and
 restart when the switch is reset.
 
+G98 users can configure one FreeBSD `vlan(4)` interface per physical RJ45
+socket with the persistent policy described in
+[docs/g98-vlan-configuration.md](docs/g98-vlan-configuration.md).
+
 Attach resets the switch and therefore clears firmware or stale VLAN state.
 While loaded, VLAN state is read directly from the hardware table.  Remove a
 group with `vlan 0`.
