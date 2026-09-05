@@ -33,6 +33,31 @@ create_args_vlan203="vlan 203"
 create_args_vlan204="vlan 204"
 ```
 
+These are `rc.conf` variables, not commands executed in sequence:
+
+| Setting | Purpose |
+|---|---|
+| `yt921x_config_enable="YES"` | Enables the installed `yt921x_config` rc.d service. It runs after the driver is loaded and before FreeBSD configures network interfaces. |
+| `yt921x_config_switches="..."` | Defines one policy per switch. The four VLAN IDs after each colon correspond, in order, to logical switch ports 0 through 3. The service enables 802.1Q mode, assigns each port its PVID and untagged VLAN membership, and adds logical CPU port 4 as a tagged member. |
+| `ifconfig_eqos0="up"` and `ifconfig_eqos1="up"` | Bring up the two CPU-facing parent interfaces. They carry tagged frames between FreeBSD and the switches and normally do not need their own IP addresses. |
+| `vlans_eqos0="..."` and `vlans_eqos1="..."` | Tell the standard FreeBSD network startup code which `vlan(4)` interfaces to create on each EQOS parent. |
+| `create_args_vlanN="vlan N"` | Assign the actual IEEE 802.1Q VLAN ID to each named `vlan(4)` interface. The interface name alone does not define its VLAN ID. |
+| `ifconfig_vlanN="..."` | Optionally assigns layer-3 addresses or other normal interface settings. OPNsense can manage this part instead. |
+
+For example, an untagged frame entering G98 `lan8` is assigned PVID 101 by
+YT9215S port 0. The switch sends it tagged through CPU port 4 and `eqos0`;
+FreeBSD receives it on `vlan101`. Traffic transmitted through `vlan101`
+follows the reverse path and leaves `lan8` untagged.
+
+Keep three values consistent when changing a VLAN: its position in
+`yt921x_config_switches`, its interface name in `vlans_eqosN`, and its
+`create_args_vlanN` ID. Interface names are technically arbitrary, but using
+the VLAN ID in the name avoids ambiguous configurations.
+
+Distinct access VLANs provide the validated per-socket isolation. Ports placed
+in the same VLAN can switch traffic directly; the driver does not currently
+expose the YT9215S hardware port-isolation masks.
+
 Assign addresses with the normal FreeBSD or OPNsense network configuration.
 For example:
 
